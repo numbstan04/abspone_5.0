@@ -1,0 +1,10 @@
+#pragma once
+
+// 占位文件：远程编解码实现将在这里添加
+// 预计支持：gRPC远程编解码服务
+
+namespace mcu { namespace media { namespace codec { namespace remote {
+
+// 预留命名空间用于远程编解码器
+
+}}}}

@@ -1,0 +1,10 @@
+#pragma once
+
+// 占位文件：硬件编解码实现将在这里添加
+// 预计支持：NVIDIA NVENC/NVDEC, Intel QSV, Linux V4L2
+
+namespace mcu { namespace media { namespace codec { namespace hardware {
+
+// 预留命名空间用于硬件编解码器
+
+}}}}
