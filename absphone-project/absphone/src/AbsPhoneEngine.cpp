@@ -209,6 +209,10 @@ struct AbsPhoneEngine::Impl {
     // 被调用服务 - media模块
     std::unique_ptr<vcs::media::IMediaControl> mediaControl;
 
+    // 应用侧 SDP 协商器（mediaAppManaged）：由 media 工厂创建，注入 gateway。
+    // 必须在 gateway 之前创建，并保证生命周期覆盖 gateway。
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> sdpNegotiator;
+
     // 观察者指针（由外部设置）
     AbsPhoneObserver* observer = nullptr;
 
@@ -373,6 +377,17 @@ ErrCode AbsPhoneEngine::Initialize(ITCTerminalType terminaltype, AbsPhoneObserve
 	impl_->gatewayManager->SetEventBus(impl_->eventBus);
 	impl_->mediaControl->SetEventBus(impl_->eventBus);
 	impl_->mediaControl->SetConfig(impl_->config);
+
+	// mediaAppManaged：pjsua 不再生成/校验 SDP，应用侧协商器必须注入 gateway。
+	// media 模块实现，gateway 只按 common 契约指针调用（不链接 media）。
+	impl_->sdpNegotiator = impl_->mediaFactory.CreateSdpNegotiator();
+	if (!impl_->sdpNegotiator) {
+		VCS_LOG_ERROR(vcs::base::LogModule::Common,
+			"AbsPhoneEngine::Initialize failed: CreateSdpNegotiator returned null");
+		Release();
+		return ErrCode::e_ErrUnspecified;
+	}
+	impl_->gatewayManager->SetMediaSdpNegotiator(impl_->sdpNegotiator);
 
 	vcs::Response gwRes = impl_->gatewayManager->Start();
 	if (!gwRes.IsSuccess()) {
@@ -663,6 +678,13 @@ ErrCode AbsPhoneEngine::SetLogLevel(uint32_t level) {
     // 旧键是唯一持久化入口：写穿后立即 Reload，让所有 logger 生效（docs/10 §3.2.3）
     impl_->config->SetInt(KEY_LOG_LEVEL, static_cast<int>(level));
     vcs::Response r = vcs::base::GetLogManager()->Reload();
+
+    // pjsip/pjmedia 有独立的日志通道，跟应用级别同步，无需重启即生效。
+    if (impl_->gatewayManager) {
+        impl_->gatewayManager->SetStackLogLevel(
+            vcs::gateway::MapAppLogLevelToPjsip(static_cast<int>(level)));
+    }
+
     return r.IsSuccess() ? ErrCode::e_ErrNone : ErrCode::e_ErrServerInternalError;
 }
 

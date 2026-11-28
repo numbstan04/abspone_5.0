@@ -235,6 +235,12 @@ void SessionManager::RemoveFromCallIdIndex(const std::vector<int>& callIds) {
     }
 }
 
+void SessionManager::RemoveFromCallIdIndex(int callId) {
+    std::lock_guard<std::mutex> lock(globalIndexLock_);
+    callIdToSessionId_.erase(callId);
+    callIdToConfId_.erase(callId);
+}
+
 std::string SessionManager::GenerateSessionId(ProtocolType protocol) {
     const uint64_t seq = sessionIdCounter_.fetch_add(1) + 1;
     std::ostringstream oss;
@@ -544,6 +550,22 @@ bool SessionManager::MarkTerminated(const std::string& sessionId, const Terminat
         }
     }
 
+    // Sweep the global index BEFORE publishing.
+    //
+    // TerminateSession() runs on the pjsip worker thread (incoming BYE ->
+    // inv_respond_incoming_bye -> on_call_state). Publishing CallTerminated
+    // executes the application's media teardown synchronously on that same
+    // thread, and that chain was observed clobbering this very stack frame:
+    // the `std::vector<int>` built below then used garbage begin/end pointers
+    // and crashed inside memmove. Building the vector first keeps this frame
+    // out of the teardown's blast radius; the observable behaviour is
+    // unchanged because the session is already erased from the shard.
+    const int terminatedCallId = session ? session->callId : -1;
+    session.reset();
+    if (terminatedCallId >= 0) {
+        RemoveFromCallIdIndex(terminatedCallId);
+    }
+
     if (eventBus_) {
         vcs::Event ev;
         ev.type = vcs::EventType::CallTerminated;
@@ -561,12 +583,6 @@ bool SessionManager::MarkTerminated(const std::string& sessionId, const Terminat
         eventBus_->Publish(ev);
     }
 
-    // The event is already enqueued; sweep the global index last. A query in
-    // the window between teardown and sweep resolves through the index to
-    // GetSession, which now misses — the observable result is identical.
-    if (session->callId >= 0) {
-        RemoveFromCallIdIndex({session->callId});
-    }
     return true;
 }
 

@@ -83,6 +83,14 @@ public:
     // [过渡] Set media control（08 号片删除：媒体不再经由 gateway 转手）
     void SetEventBus(std::shared_ptr<vcs::IEventBus> bus) override;
 
+    // Application-managed media SDP: forwarded to every adapter (including
+    // adapters registered after this call).
+    void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) override;
+
+    // Protocol stack logging: forwarded to all adapters.
+    void SetStackLogLevel(int level) override;
+
     // 收包门（docs/09 §2.2）
     Response StartTransport(const std::string& sessionId) override;
     Response StopTransport(const std::string& sessionId) override;
@@ -151,6 +159,9 @@ private:
 
     // The single source of truth (docs/07)
     std::unique_ptr<SessionManager> sessionManager_;
+
+    // Application-side SDP negotiator (mediaAppManaged); shared with adapters
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> sdpNegotiator_;
 
     // Thread safety
     mutable std::mutex mutex_;

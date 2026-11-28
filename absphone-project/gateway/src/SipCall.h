@@ -11,6 +11,7 @@
 #include "SipCallHandler.h"
 #include "gateway_export.h"
 #include "NegotiatedCodec.h"
+#include "IMediaSdpNegotiator.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -257,6 +258,26 @@ public:
     }
 
     /**
+     * @brief Inject the application-side SDP negotiator (mediaAppManaged)
+     *
+     * When set, MakeCall() builds its offer through it (pjsua refuses to place
+     * an app-managed call without SDP) and onCallRxOffer() builds the answer.
+     */
+    void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) {
+        sdpNegotiator_ = std::move(negotiator);
+    }
+
+    /**
+     * @brief Keep the SDP body carried by the incoming INVITE
+     *
+     * pjsua2 clears pjsua_call::incoming_data before invoking
+     * Account::onIncomingCall, so the remote offer must be captured there and
+     * handed over; Answer() builds the answer from it.
+     */
+    void SetIncomingOfferSdp(const std::string& sdp) { incomingOfferSdp_ = sdp; }
+
+    /**
      * @brief Set local signaling port (used in the Contact header of the
      *        raw 200 OK; 0 = fall back to the INVITE transport's local port)
      */
@@ -346,6 +367,12 @@ private:
     uint16_t localAudioPort_ = 4004;  // Local audio port
     uint16_t localVideoPort_ = 4002;  // Local video port
     uint16_t localSignalingPort_ = 0; // Local SIP port for the Contact header
+
+    // Application-side SDP negotiator (mediaAppManaged); may be null.
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> sdpNegotiator_;
+
+    // Remote offer captured from the incoming INVITE (pjsua2 frees its own copy).
+    std::string incomingOfferSdp_;
 
     // Private clone of the INVITE that started this call (external-SDP answer).
     // Owned by this object; released with pjsip_rx_data_free_cloned().

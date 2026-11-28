@@ -220,6 +220,10 @@ private:
     static constexpr uint64_t LOG_INTERVAL_MS = 5000;
     uint64_t lastLogTime_ = 0;
     uint64_t packetCountSinceLastLog_ = 0;
+    // Consecutive soft receive errors (e.g. WSAECONNRESET caused by an ICMP
+    // port-unreachable for an earlier send). Reset on a successful receive;
+    // a runaway counter means the socket is really gone.
+    int consecutiveSoftRecvErrors_ = 0;
 };
 
 }} // namespace vcs::gateway

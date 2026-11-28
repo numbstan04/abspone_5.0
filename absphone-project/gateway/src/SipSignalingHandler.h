@@ -3,6 +3,7 @@
 #include "SignalingHandler.h"
 #include "SipCallHandler.h"
 #include "MediaConfig.h"
+#include "IMediaSdpNegotiator.h"
 #include "IRtpTransport.h"
 #include "RtpPortAllocator.h"
 #include <memory>
@@ -148,6 +149,21 @@ public:
 
     void SetLocalMediaAddress(const std::string& address) override;
     void SetLocalMediaPorts(uint16_t audioPort, uint16_t videoPort) override;
+
+    /**
+     * @brief Inject the application-side SDP negotiator (mediaAppManaged)
+     *
+     * Stored here and handed to every SipCall (outbound) plus used directly by
+     * handleInvite (inbound 200 OK), so SDP is created and validated by the
+     * application layer instead of pjsua.
+     */
+    void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) {
+        sdpNegotiator_ = std::move(negotiator);
+    }
+
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator>
+        GetMediaSdpNegotiator() const { return sdpNegotiator_; }
     // [V7.0 Phase-2 D] Three-port overload for terminals that carry audio +
     // main video + secondary video (content sharing) on three independent
     // UDP sockets / transports.
@@ -254,7 +270,8 @@ private:
     void OnRegistrationSuccess(int accountId) override;
     void OnRegistrationFailure(int accountId, uint32_t code, const std::string& reason) override;
     void OnIncomingCall(int accountId, int callId, const std::string& callerUri,
-                        const std::string& callerDisplayName) override;
+                        const std::string& callerDisplayName,
+                        const std::string& sdpBody) override;
     void OnCallState(int callId, uint32_t state, const std::string& stateText) override;
     void OnCallMediaReady(int callId,
                           const std::string& remoteAddress,
@@ -292,6 +309,19 @@ private:
     // Call management
     SipCall* GetActiveCall(int callId);
     void RemoveActiveCall(int callId);
+
+    /**
+     * @brief 延迟销毁 RemoveActiveCall 摘下的呼叫对象
+     *
+     * RemoveActiveCall() 是从 SipCall::onCallState() 内部被调到的
+     * （onCallState -> callback_->OnCallState -> TerminateSession ->
+     * RemoveActiveCall）。此时该 SipCall 对象正处在自己的回调栈上，
+     * 直接 erase 会析构掉正在执行的 this，回调返回后任何成员访问
+     * （例如 onCallState 末尾的日志）都是 use-after-free。
+     * 因此摘下的 unique_ptr 先寄存，等回到 pjsip 的入口回调（此时
+     * 旧对象的栈帧已经展开完毕）再统一销毁。
+     */
+    void DrainRetiredCalls();
 
     // Get PJSIP Endpoint (from SipAdapter)
     pj::Endpoint& GetPjsipEndpoint() const;
@@ -370,10 +400,22 @@ private:
     // pooling by setting the configured range to size 0).
     RtpPortAllocator portAllocator_;
 
+    // Application-side SDP negotiator (mediaAppManaged). Null = pjsua builds SDP.
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> sdpNegotiator_;
+
+    // Per-call RTP ports taken from portAllocator_ (inbound and outbound),
+    // keyed by callId. Zero values mean "not from the pool".
+    // Guarded by callsMutex_.
+    std::map<int, std::pair<uint16_t, uint16_t>> callPorts_;
+
     SipAdapter& sipAdapter_;     // SipAdapter reference (holds pj::Endpoint)
     std::unique_ptr<SipAccount> sipAccount_;
     pj::AccountConfig accountConfig_;
     std::map<int, std::unique_ptr<SipCall>> activeCalls_;
+
+    // 已摘下但尚未销毁的呼叫（见 DrainRetiredCalls）。Guard by callsMutex_.
+    std::vector<std::unique_ptr<SipCall>> retiredCalls_;
+
     std::mutex callsMutex_;
 
     bool pjsipInitialized_;

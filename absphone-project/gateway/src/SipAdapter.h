@@ -9,6 +9,7 @@
 #include "IRtpTransport.h"
 #include "Response.h"
 #include "MediaConfig.h"
+#include "StackLogConfig.h"
 #include "SessionContext.h"
 #include "CallSession.h"
 #include <string>
@@ -46,8 +47,10 @@ public:
      * @brief Constructor
      * @param listenAddress Listen address
      * @param port Listen port
+     * @param logSettings Protocol stack (pjsip) log settings from the upper layer
      */
-    SipAdapter(const std::string& listenAddress, uint16_t port);
+    SipAdapter(const std::string& listenAddress, uint16_t port,
+               const PjsipLogSettings& logSettings = PjsipLogSettings());
     ~SipAdapter() override;
 
     // ============================================================
@@ -238,6 +241,27 @@ public:
                             uint16_t secondaryVideoPort);
 
     /**
+     * @brief Inject the application-side SDP negotiator (mediaAppManaged)
+     *
+     * Forwarded to SipSignalingHandler and from there to each SipCall, which
+     * builds its own offer/answer instead of letting pjsua generate SDP.
+     */
+    void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) override;
+
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator>
+        GetMediaSdpNegotiator() const override { return sdpNegotiator_; }
+
+    /**
+     * @brief Change pjsip/pjmedia log level at runtime
+     * @param level pj_log level 0..6 (0=off, 6=trace)
+     *
+     * pjsua re-applies the logging config; the existing writer (which routes
+     * pjsip logs into the gateway logger) is preserved.
+     */
+    void SetStackLogLevel(int level) override;
+
+    /**
      * @brief Create media transport and inject into PJSIP
      *
      * @param callId Session's callId
@@ -368,6 +392,14 @@ private:
     uint16_t localAudioPort_         = 4004;    // Local audio port
     uint16_t localVideoPort_         = 4002;    // Local main-video port
     uint16_t localSecondaryVideoPort_= 4006;    // Local secondary-video (content sharing) port
+
+    // Application-side SDP negotiator (mediaAppManaged). Shared with
+    // SipSignalingHandler/SipCall; null means "let pjsua generate SDP".
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> sdpNegotiator_;
+
+    // Protocol stack log settings (from the upper layer); applied at libInit
+    // and re-applied on SetStackLogLevel().
+    PjsipLogSettings logSettings_;
 
     // PJSIP Endpoint - unified management
     std::unique_ptr<pj::Endpoint> pjsipEndpoint_;

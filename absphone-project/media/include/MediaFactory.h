@@ -20,6 +20,9 @@ public:
 
     std::unique_ptr<IMediaControl> CreateMediaControl() override;
 
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator>
+        CreateSdpNegotiator() override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

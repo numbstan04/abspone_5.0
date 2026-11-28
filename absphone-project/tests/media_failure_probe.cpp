@@ -132,6 +132,11 @@ public:
 
     void SetEventBus(std::shared_ptr<IEventBus>) override {}
 
+    void SetMediaSdpNegotiator(
+        std::shared_ptr<media_config::IMediaSdpNegotiator>) override {}
+
+    void SetStackLogLevel(int) override {}
+
     Response RegisterGW(std::string&, int, int, int, int) override { return Response::Success(); }
     Response UnregisterGW(int) override { return Response::Success(); }
     Response IsGWRegistered(int, bool& registered) override {

@@ -74,6 +74,10 @@ std::unique_ptr<IGatewayManager> GatewayFactory::CreateGatewayManager(vcs::base:
     uint16_t sipAudioPort = 0;    // 0 = auto-detect available port
     uint16_t sipVideoPort = 0;    // 0 = auto-detect available port
 
+    // pjsip 自己的日志通道：由上层配置决定是否打开、开到什么程度。
+    // 未显式配置 pjsip_log_level 时跟随应用日志级别（log.level）。
+    PjsipLogSettings pjsipLog;
+
     if (config) {
         // 监听端点只读旧文件的复合值（docs/10 A-55/A-56），不再使用自制键。
         ListenerSpec sipSpec;
@@ -120,6 +124,24 @@ std::unique_ptr<IGatewayManager> GatewayFactory::CreateGatewayManager(vcs::base:
         sipMediaAddress = config->GetString("gateway.sip.media_address", "");
         sipAudioPort = static_cast<uint16_t>(config->GetInt("gateway.sip.audio_port", 0));
         sipVideoPort = static_cast<uint16_t>(config->GetInt("gateway.sip.video_port", 0));
+
+        // Protocol stack (pjsip) logging: explicit level wins, otherwise follow
+        // the application log level so a single knob raises both channels.
+        const int configuredLevel = config->GetInt("gateway.sip.pjsip_log_level", -1);
+        if (configuredLevel >= 0) {
+            pjsipLog.level = ClampPjsipLogLevel(configuredLevel);
+        } else {
+            pjsipLog.level = MapAppLogLevelToPjsip(config->GetInt("log.level", 2));
+        }
+        // SIP 报文转储：报文里带 Authorization / SDP，排障时才开。
+        pjsipLog.msgLogging = config->GetBool("gateway.sip.pjsip_msg_logging", true);
+
+        // pjsip 独立日志文件（追加写），不再进入 Gateway.log。
+        const std::string pjsipLogFile = config->GetString("gateway.sip.pjsip_log_file",
+                                                           "siplog.log");
+        if (!pjsipLogFile.empty()) {
+            pjsipLog.logFile = pjsipLogFile;
+        }
     }
 
     // [V5.5 Critical Fix] If config is empty, auto-detect local IP address
@@ -147,7 +169,7 @@ std::unique_ptr<IGatewayManager> GatewayFactory::CreateGatewayManager(vcs::base:
 
     // Create and register the SIP adapter (GatewayManager::RegisterAdapter
     // injects the shared SessionManager into it)
-    auto sipAdapter = CreateSipAdapter(sipAddress, sipPort);
+    auto sipAdapter = CreateSipAdapter(sipAddress, sipPort, pjsipLog);
     if (sipAdapter) {
         // Configure local media
         sipAdapter->SetLocalMediaAddress(sipMediaAddress);
@@ -178,11 +200,14 @@ std::unique_ptr<IGatewayManager> GatewayFactory::CreateGatewayManager(vcs::base:
 
 std::unique_ptr<IProtocolAdapter> GatewayFactory::CreateSipAdapter(
     const std::string& listenAddress,
-    uint16_t port) {
-    VCS_GATEWAY_LOG_INFO("Creating SIP adapter: %s:%u", listenAddress.c_str(), port);
+    uint16_t port,
+    const PjsipLogSettings& logSettings) {
+    VCS_GATEWAY_LOG_INFO("Creating SIP adapter: %s:%u (pjsip log level=%d, msgLogging=%d)",
+                         listenAddress.c_str(), port,
+                         logSettings.level, logSettings.msgLogging ? 1 : 0);
 
     try {
-        auto adapter = std::make_unique<SipAdapter>(listenAddress, port);
+        auto adapter = std::make_unique<SipAdapter>(listenAddress, port, logSettings);
         VCS_GATEWAY_LOG_INFO("SIP adapter created successfully");
         return adapter;
     } catch (const std::exception& e) {

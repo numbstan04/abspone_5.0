@@ -638,6 +638,28 @@ void SimpleRtpTransport::OnAsyncReceiveComplete(
                 this);
             return;
         }
+        // Windows reports WSAECONNRESET (10054) on a UDP socket when an ICMP
+        // port-unreachable arrives for a previous send - typically because the
+        // peer has not bound its RTP port yet. The socket itself is still
+        // usable, so re-arm instead of killing the receive path: exiting here
+        // used to stop all inbound media for that stream right after call
+        // setup (video transport in particular).
+        if (ec == boost::asio::error::connection_reset ||
+            ec == boost::asio::error::connection_refused ||
+            ec == boost::asio::error::connection_aborted ||
+            ec == boost::asio::error::host_unreachable ||
+            ec == boost::asio::error::network_unreachable) {
+            if (consecutiveSoftRecvErrors_++ < 100 && receiving_.load()) {
+                PostAsyncReceive();
+            }
+            else {
+                VCS_GATEWAY_LOG_WARNING(
+                    "[DIAG-ReceiveLoop] this=%p, giving up after %d consecutive "
+                    "receive errors: %s",
+                    this, consecutiveSoftRecvErrors_, ec.message().c_str());
+            }
+            return;
+        }
         VCS_GATEWAY_LOG_WARNING(
             "[DIAG-ReceiveLoop] this=%p, async_receive_from error: %s",
             this, ec.message().c_str());
@@ -646,6 +668,8 @@ void SimpleRtpTransport::OnAsyncReceiveComplete(
         // StopReceiving() can join().
         return;
     }
+
+    consecutiveSoftRecvErrors_ = 0;
 
     if (bytes > 0) {
         stats_.packetsReceived++;

@@ -1151,8 +1151,30 @@ namespace vcs {
 				}
 
 				bool EnsureVideoRecv(MemberState& m, uint32_t remoteSsrc, int pt) {
+					// Static audio payload types can never be video. The backend
+					// normally classifies these before reaching us; this guard
+					// keeps one mis-routed packet (e.g. PCMA/8 while we send
+					// PCMU/0) from creating a VideoReceiveStream whose SSRC and
+					// payload type belong to the audio stream - that stream would
+					// then swallow every audio packet and never deliver a frame.
+					switch (pt) {
+					case 0: case 8: case 9: case 13: case 18:
+						return false;
+					default:
+						break;
+					}
+
 					if (m.videoRecv) {
-						return m.videoRecvSsrc == remoteSsrc;
+						if (m.videoRecvSsrc == remoteSsrc) return true;
+						// The peer changed its video SSRC (re-offer / restart):
+						// rebuild instead of silently dropping its packets forever.
+						m.call->DestroyVideoReceiveStream(m.videoRecv);
+						m.videoRecv = nullptr;
+						m.videoRecvSsrc = 0;
+						m.videoRecvPt = -1;
+						// The pass-through decoder factory embeds the remote SSRC
+						// used when PacketInfos() is empty; refresh it as well.
+						m.decoderFactory.reset();
 					}
 					if (!EnsureCall(m)) return false;
 
@@ -1321,14 +1343,20 @@ namespace vcs {
 								m.audioRecv = nullptr;
 							}
 						}
-						m.audioState = nullptr;
+						// The ADM owns the capture and playout threads; both call
+						// into AudioState (AudioTransportImpl) and the APM. They
+						// MUST be stopped and joined before audioState is released,
+						// otherwise a remote BYE races the playout thread inside
+						// NeedMorePlayData() / RecordedDataIsAvailable() and it
+						// dereferences freed audio state.
 						if (m.adm) {
 							m.adm->Terminate();
-							m.adm = nullptr;
 						}
+						m.call.reset();
+						m.audioState = nullptr;
+						m.adm = nullptr;
 						m.apm = nullptr;
 						m.mixer = nullptr;
-						m.call.reset();
 						m.encoderBridge.reset();
 						m.encoderFactory.reset();
 						m.bitrateAllocatorFactory.reset();

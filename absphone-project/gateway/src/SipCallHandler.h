@@ -45,8 +45,12 @@ public:
     // ========== Call-related callbacks ==========
 
     /// Incoming call
+    /// @param sdpBody SDP body carried by the INVITE (the remote offer).
+    ///        Needed because pjsua2 clears pjsua_call::incoming_data before
+    ///        invoking this callback, so the offer must be captured here.
     virtual void OnIncomingCall(int accountId, int callId, const std::string& callerUri,
-                                const std::string& callerDisplayName) = 0;
+                                const std::string& callerDisplayName,
+                                const std::string& sdpBody) = 0;
 
     /// Call state changed
     virtual void OnCallState(int callId, uint32_t state, const std::string& stateText) = 0;

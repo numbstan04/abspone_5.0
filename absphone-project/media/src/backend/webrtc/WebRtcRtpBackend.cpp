@@ -75,6 +75,27 @@ namespace vcs {
 				return true;
 			}
 
+			/// Static (RFC 3551) audio payload types.
+			///
+			/// Inbound routing cannot rely on the negotiated *send* payload type:
+			/// the peer may answer with a different codec (e.g. it sends PCMA/8
+			/// while we send PCMU/0). A PT that is unambiguously audio must never
+			/// be handed to the video engine - doing so used to poison
+			/// VideoReceiveStream (created with the audio SSRC/PT) and stall video
+			/// forever.
+			bool IsStaticAudioPayloadType(uint8_t pt) {
+				switch (pt) {
+				case 0:   // PCMU
+				case 8:   // PCMA
+				case 9:   // G722
+				case 13:  // comfort noise
+				case 18:  // G.729
+					return true;
+				default:
+					return false;
+				}
+			}
+
 			int ToEngineKind(vcs::MediaStreamKind kind) {
 				switch (kind) {
 				case vcs::MediaStreamKind::Audio:
@@ -420,6 +441,14 @@ namespace vcs {
 				return;
 			}
 
+			// The peer may pick a different audio codec than we send, so the
+			// route's "audio" PT is not authoritative for ingress.
+			if (IsStaticAudioPayloadType(pt) && pt != route.videoPt) {
+				engine_->OnRtpPacket(memberId.c_str(),
+					webrtc_engine::kMediaStreamAudio, data, len);
+				return;
+			}
+
 			const bool videoByPt = IsVideoPayload(route, pt);
 			const bool videoBySsrc = route.videoRecvSsrc != 0 &&
 				ssrc == route.videoRecvSsrc;
@@ -432,11 +461,10 @@ namespace vcs {
 				return;
 			}
 
-			// Unknown payload type (RTX, FEC, telephone-event, ...): offer it
-			// to the engine so NACK/RTX demuxing can see it, but keep the
-			// legacy path silent because RTPEngine would drop it anyway.
-			engine_->OnRtpPacket(memberId.c_str(),
-				webrtc_engine::kMediaStreamVideo, data, len);
+			// Unknown payload type (unnegotiated RTX, FEC, telephone-event...).
+			// Do NOT hand it to the video engine: the receive stream would be
+			// created from this packet's SSRC/PT and never decode again.
+			// Dropping is safe; RTX/FEC need explicit config to be useful.
 		}
 
 		void WebRtcRtpBackend::OnRtpReceived(const std::string& memberId,

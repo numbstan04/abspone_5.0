@@ -18,56 +18,9 @@
 #include <pjmedia/master_port.h>
 #include <pjmedia/null_port.h>
 #include <pjsua-lib/pjsua.h>
+#include <pjsua-lib/pjsua_internal.h>   // pjsua_var.log_cfg for runtime re-config
 
 namespace vcs { namespace gateway {
-
-namespace {
-
-// Route PJSIP's own log through the gateway logger so LogLevel governs it.
-// The writer is reached only for levels <= logConfig.consoleLevel (pjsua
-// gates the callback on it), and once a writer is installed nothing goes to
-// the console. SIP message dumps stay off: they carry Authorization headers.
-// PJSIP levels: 1 fatal, 2 error, 3 warning, 4 info, 5/6 debug/trace.
-class PjsipLogWriter : public pj::LogWriter {
-public:
-    void write(const pj::LogEntry& entry) override {
-        std::string msg = entry.msg;
-        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
-            msg.pop_back();
-        }
-        if (msg.empty()) return;
-
-        // The vendored pjmedia SRTP transport logs per-call diagnostics at
-        // level 1 (fatal) and per-packet traces at level 1/4; keep them out of
-        // WARN/ERROR so those stay signal, and push per-packet lines to TRACE.
-        const bool vendorPerPacket =
-            msg.find("SRTP RX") != std::string::npos ||
-            msg.find("H264 VIDEO PACKET DETECTED") != std::string::npos ||
-            msg.find("External RTP callback is NULL") != std::string::npos;
-        const bool vendorVerbose =
-            msg.compare(0, 12, "=== SRTP Tra") == 0 ||
-            msg.find("pjmedia_transport_srtp_set_external_callback called") !=
-                std::string::npos;
-
-        if (vendorPerPacket) {
-            VCS_GATEWAY_LOG_TRACE("[pjsip] %s", msg.c_str());
-        } else if (vendorVerbose) {
-            VCS_GATEWAY_LOG_DEBUG("[pjsip] %s", msg.c_str());
-        } else if (entry.level <= 2) {
-            VCS_GATEWAY_LOG_ERROR("[pjsip] %s", msg.c_str());
-        } else if (entry.level == 3) {
-            // PJPROJECT also logs routine banners/timer dumps at level 3,
-            // so pjsip warnings stay at Info to keep WARN meaningful.
-            VCS_GATEWAY_LOG_INFO("[pjsip] %s", msg.c_str());
-        } else if (entry.level == 4) {
-            VCS_GATEWAY_LOG_DEBUG("[pjsip] %s", msg.c_str());
-        } else {
-            VCS_GATEWAY_LOG_TRACE("[pjsip] %s", msg.c_str());
-        }
-    }
-};
-
-} // anonymous namespace
 
 namespace {
 
@@ -123,13 +76,16 @@ void LogNegotiatedCodec(const char* kind, const vcs::NegotiatedCodec& codec) {
 // SipAdapter Implementation
 // ===================================================================
 
-SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port)
+SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port,
+                       const PjsipLogSettings& logSettings)
     : type_("SIP")
     , listenAddress_(listenAddress)
     , port_(port)
     , running_(false)
     , callback_(nullptr)
-    , videoConfigValid_(false) {
+    , videoConfigValid_(false)
+    , logSettings_(logSettings) {
+    logSettings_.level = ClampPjsipLogLevel(logSettings_.level);
 
     // [V5.6] SessionManager is injected by GatewayManager via SetSessionManager().
     // We no longer create a SessionManager instance here. This allows the same
@@ -157,16 +113,22 @@ SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port)
     // Configuration
     pj::EpConfig epConfig;
 
-    // PJSIP logging is an independent channel by default; bind it to ours.
-    // The writer instance is owned and deleted by pj::Endpoint.
-    // pjsua's internal log_writer gates the LogWriter callback on
-    // (level <= consoleLevel) and does NOT print to the console once a
-    // writer is installed. consoleLevel must therefore equal level, or
-    // PJSIP logs are discarded before reaching our logger.
-    epConfig.logConfig.level = 4;          // info and above
-    epConfig.logConfig.consoleLevel = 4;   // gate for the writer callback
-    epConfig.logConfig.msgLogging = 0;     // never dump SIP messages (auth/SDP secrets)
-    epConfig.logConfig.decor = 0;          // our logger adds its own decoration
+    // pjsip 日志独立落盘到自己的文件（默认 siplog.log），不再汇入 Gateway.log。
+    // 级别来自上层配置（gateway.sip.pjsip_log_level，-1 时跟随 log.level）。
+    // consoleLevel=0 表示不再把同一条日志转给 console / 其它 writer，
+    // 保证 pjsip 只写文件。
+    epConfig.logConfig.level = logSettings_.level;
+    epConfig.logConfig.consoleLevel = 0;
+    epConfig.logConfig.msgLogging = logSettings_.msgLogging ? 1 : 0;
+    // 独立文件需要可读的格式：时间 + 级别 + 换行（decor=0 时整份日志会连成一行）。
+    epConfig.logConfig.decor =
+        PJ_LOG_HAS_TIME | PJ_LOG_HAS_LEVEL_TEXT | PJ_LOG_HAS_NEWLINE;
+    epConfig.logConfig.filename = logSettings_.logFile;
+    epConfig.logConfig.fileFlags = PJ_O_APPEND;  // 追加写，重启不清空
+
+    VCS_GATEWAY_LOG_INFO("[SIP] pjsip log: level=%d (0=off..6=trace), msgLogging=%d, file=%s",
+                         logSettings_.level, logSettings_.msgLogging ? 1 : 0,
+                         logSettings_.logFile.c_str());
 
     epConfig.medConfig.quality = 8;
     epConfig.medConfig.audioFramePtime = 20;  // 20ms for G.722
@@ -202,9 +164,10 @@ SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port)
     try {
         // pjsua_create() runs before libInit() installs our writer, so pjlib's
         // default console writer would print startup banners regardless of
-        // LogLevel. Raise pjlib's console gate to 0 first; pjsua_init()
-        // re-applies epConfig.logConfig.level once our writer is installed.
-        pj_log_set_level(0);
+        // LogLevel. Open the gate wide first (or shut it when logging is off);
+        // pjsua_init() re-applies epConfig.logConfig.level once our writer is
+        // installed.
+        pj_log_set_level(logSettings_.level > 0 ? 5 : 0);
 
         VCS_GATEWAY_LOG_DEBUG("[SIP] Calling libCreate()...");
         pjsipEndpoint_->libCreate();
@@ -212,9 +175,7 @@ SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port)
 
 		
         VCS_GATEWAY_LOG_DEBUG("[SIP] Calling libInit()...");
-        // Ownership transfers to the endpoint in libInit; allocate as late as
-        // possible so a failed libCreate() cannot leak it.
-        epConfig.logConfig.writer = new PjsipLogWriter();
+        // 不安装 LogWriter：pjsip 日志只由 pjsua 自己写入 logConfig.filename。
         pjsipEndpoint_->libInit(epConfig);
         VCS_GATEWAY_LOG_INFO("[SIP] libInit() OK");
 
@@ -382,6 +343,12 @@ SipAdapter::SipAdapter(const std::string& listenAddress, uint16_t port)
         if (!localMediaAddress_.empty() && localAudioPort_ > 0 && localVideoPort_ > 0) {
             signalingHandler_->SetLocalMediaAddress(localMediaAddress_);
             signalingHandler_->SetLocalMediaPorts(localAudioPort_, localVideoPort_);
+        }
+
+        // App-managed media: SDP is created/validated by the application layer.
+        if (sdpNegotiator_) {
+            signalingHandler_->SetMediaSdpNegotiator(sdpNegotiator_);
+            VCS_GATEWAY_LOG_INFO("[SIP] SDP negotiator forwarded to SipSignalingHandler");
         }
 
         // [CORE] Register call established callback, create external RTP transport when INVITE enters CONFIRMED state
@@ -1134,6 +1101,57 @@ void SipAdapter::OnCallConnected(int callId) {
 			VCS_GATEWAY_LOG_INFO("[SDP] no codec parsed from remote SDP");
 		}
 
+		// ============================================================
+		// mediaAppManaged：pjsua 不再创建媒体通道，GetPjMediaTransport()
+		// 返回空。此时 RTP 必须由应用侧在本端 offer 通告的端口上自建，
+		// 与入呼路径（onExternalCallEstablished）保持同一套传输实现。
+		// ============================================================
+		auto createAppManagedTransport =
+			[this, &session](MediaStreamKind kind, uint16_t localPort,
+				const std::string& remoteAddr, int remotePort,
+				uint8_t payloadType) -> std::shared_ptr<IRtpTransport> {
+			if (localPort == 0 || remotePort <= 0 || remoteAddr.empty()) {
+				return nullptr;
+			}
+			// re-CONFIRMED 会二次进入：复用首次建立的传输对象。
+			auto existing = session->GetTransportObjectByKind(kind);
+			if (existing) {
+				return existing;
+			}
+
+			SimpleRtpConfig cfg;
+			cfg.localAddress = localMediaAddress_;
+			cfg.localPort = localPort;
+			cfg.defaultPayloadType = payloadType;
+			cfg.enableRtcp = false;
+
+			RtpDestination dest;
+			dest.address = remoteAddr;
+			dest.port = static_cast<uint16_t>(remotePort);
+			dest.payloadType = payloadType;
+			dest.ssrc = 0;
+			cfg.destinations.push_back(dest);
+
+			auto transport = std::make_shared<SimpleRtpTransport>(
+				session->sessionId +
+					(kind == MediaStreamKind::Audio ? "_audio" : "_video"),
+				cfg);
+			if (!transport->Open()) {
+				VCS_GATEWAY_LOG_ERROR("[SIP] Failed to open app-managed %s transport "
+					"(local=%u, remote=%s:%d)",
+					vcs::MediaStreamKindToString(kind), localPort,
+					remoteAddr.c_str(), remotePort);
+				return nullptr;
+			}
+			transport->SetRtcpMux(false);
+			VCS_GATEWAY_LOG_INFO("[SIP] App-managed %s transport created: local=%s:%u, "
+				"remote=%s:%d (pt=%u)",
+				vcs::MediaStreamKindToString(kind),
+				transport->GetLocalAddress().c_str(), transport->GetLocalPort(),
+				remoteAddr.c_str(), remotePort, payloadType);
+			return transport;
+		};
+
 		// 音频：用 SipMediaTransport 包 PJSIP 的 transport（media index 0）。
 		// re-CONFIRMED 会二次进入本函数：已存在的传输对象必须复用，媒体层
 		// 握着首次 CONFIRMED 时拿到的那个 shared_ptr（见 BindOrReuseTransport）。
@@ -1151,7 +1169,20 @@ void SipAdapter::OnCallConnected(int callId) {
 				}
 			}
 			else {
-				VCS_GATEWAY_LOG_WARNING("[SIP] PJSIP audio transport is NULL for callId=%d", callId);
+				VCS_GATEWAY_LOG_INFO("[SIP] No PJSIP audio transport (app-managed media); "
+					"building application transport for callId=%d", callId);
+				auto t = createAppManagedTransport(
+					MediaStreamKind::Audio,
+					call->GetLocalAudioPort(),
+					audioAddr, audioPort,
+					static_cast<uint8_t>(audioCodec.codecName == "PCMA" ? 8 : audioCodec.payloadType));
+				if (t) {
+					transports[MediaStreamKind::Audio] = t;
+				}
+				else {
+					VCS_GATEWAY_LOG_WARNING("[SIP] App-managed audio transport unavailable for callId=%d",
+						callId);
+				}
 			}
 		}
 
@@ -1170,7 +1201,20 @@ void SipAdapter::OnCallConnected(int callId) {
 				}
 			}
 			else {
-				VCS_GATEWAY_LOG_WARNING("[SIP] PJSIP video transport is NULL for callId=%d", callId);
+				VCS_GATEWAY_LOG_INFO("[SIP] No PJSIP video transport (app-managed media); "
+					"building application transport for callId=%d", callId);
+				auto t = createAppManagedTransport(
+					MediaStreamKind::Video,
+					call->GetLocalVideoPort(),
+					videoAddr, videoPort,
+					static_cast<uint8_t>(videoCodec.payloadType > 0 ? videoCodec.payloadType : 97));
+				if (t) {
+					transports[MediaStreamKind::Video] = t;
+				}
+				else {
+					VCS_GATEWAY_LOG_WARNING("[SIP] App-managed video transport unavailable for callId=%d",
+						callId);
+				}
 			}
 		}
 	}
@@ -1381,6 +1425,42 @@ void SipAdapter::SetLocalMediaAddress(const std::string& address) {
     if (signalingHandler_) {
         signalingHandler_->SetLocalMediaAddress(address);
     }
+}
+
+void SipAdapter::SetStackLogLevel(int level) {
+    const int clamped = ClampPjsipLogLevel(level);
+    logSettings_.level = clamped;
+
+    // pjsua 还没起来时只记录配置，libInit 会应用它。
+    if (!pjsua_var.endpt || !pjsua_var.pool) {
+        VCS_GATEWAY_LOG_INFO("[SIP] pjsip log level queued: %d", clamped);
+        return;
+    }
+
+    // 复制当前配置（保留日志文件名/追加标志），只调整级别门槛。
+    // console_level 固定为 0：pjsip 日志只落 siplog.log，不进 Gateway.log。
+    pjsua_logging_config cfg = pjsua_var.log_cfg;
+    cfg.level = clamped;
+    cfg.console_level = 0;
+
+    pj_status_t status = pjsua_reconfigure_logging(&cfg);
+    if (status != PJ_SUCCESS) {
+        VCS_GATEWAY_LOG_ERROR("[SIP] pjsua_reconfigure_logging(%d) failed: %d",
+                              clamped, status);
+        return;
+    }
+
+    VCS_GATEWAY_LOG_INFO("[SIP] pjsip log level changed to %d", clamped);
+}
+
+void SipAdapter::SetMediaSdpNegotiator(
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) {
+    sdpNegotiator_ = std::move(negotiator);
+    if (signalingHandler_) {
+        signalingHandler_->SetMediaSdpNegotiator(sdpNegotiator_);
+    }
+    VCS_GATEWAY_LOG_INFO("[SIP] SDP negotiator %s",
+                         sdpNegotiator_ ? "set on adapter" : "cleared on adapter");
 }
 
 void SipAdapter::SetLocalMediaPorts(uint16_t audioPort, uint16_t videoPort) {

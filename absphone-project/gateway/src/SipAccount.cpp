@@ -41,6 +41,18 @@ void SipAccount::Configure(const std::string& uri,
     pendingConfig_.callConfig.timerSessExpiresSec = 1800;
 
     // ============================================================
+    // 应用自管理媒体（mediaAppManaged）
+    //
+    // 打开后 pjsua 不再生成/校验 SDP，也不再创建媒体通道：
+    //   * 出呼：必须由应用提供 offer（SipCall::MakeCall 走
+    //     IMediaSdpNegotiator::CreateOffer），否则 makeCall 返回 PJ_EINVALIDOP；
+    //   * 入呼：应用构造 answer 并校验对端 offer（SipSignalingHandler）；
+    //   * RTP 全部由应用侧传输承担（SimpleRtpTransport / SipMediaTransport）。
+    // 该开关只能在账号创建时设置，运行中不允许切换。
+    // ============================================================
+    pendingConfig_.callConfig.mediaAppManaged = true;
+
+    // ============================================================
     // SRTP Configuration (set by application layer via SetSrtpConfig()).
     // Map SrtpMode to PJSIP's srtpUse value.
     // ============================================================
@@ -213,8 +225,28 @@ VCS_GATEWAY_LOG_INFO("[SipAccount] Incoming call on account %d, callId=%d", accI
 
     VCS_GATEWAY_LOG_INFO("[SipAccount] Caller URI: %s", callerUri.c_str());
 
+    // 取 INVITE 的 SDP body。pjsua2 在调用本回调前就把
+    // pjsua_call::incoming_data 置空了（见 pjsua2 Endpoint::on_incoming_call），
+    // 所以对端 offer 只能从 prm.rdata 里取。
+    std::string sdpBody;
+    {
+        const std::string& wholeMsg = prm.rdata.wholeMsg;
+        size_t sep = wholeMsg.find("\r\n\r\n");
+        size_t sepLen = 4;
+        if (sep == std::string::npos) {
+            sep = wholeMsg.find("\n\n");
+            sepLen = 2;
+        }
+        if (sep != std::string::npos) {
+            sdpBody = wholeMsg.substr(sep + sepLen);
+        }
+    }
+    if (sdpBody.empty()) {
+        VCS_GATEWAY_LOG_WARNING("[SipAccount] INVITE has no SDP body (callId=%d)", callId);
+    }
+
     // Notify the upper layer of the inbound call
-    callback_->OnIncomingCall(accId, callId, callerUri, callerDisplayName);
+    callback_->OnIncomingCall(accId, callId, callerUri, callerDisplayName, sdpBody);
 }
 
 }} // namespace vcs::gateway

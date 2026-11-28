@@ -106,13 +106,9 @@ bool SipCall::MakeCall(const std::string& target, int audioCount, int videoCount
 		pj::CallOpParam param;
 
 		// pjsua 只承担信令。mediaDir=NONE 让它自己生成的 m-line 保持 inactive；
-		// 线上 SDP 由 onCallSdpCreated() 用 "真实绑定端口" 重写，仍是
-		// sendrecv（应用要收发）。
-		// 出呼时 pjsua 不会应用这里的 mediaDir（我方是 offerer，answer 来自
-		// 对端，apply_med_update 里那条分支被跳过），所以协议栈侧不发送 RTP
-		// 由 onStreamCreated() 压住编码器 / 账户关闭视频自动发送来保证。
-		// audioCount/videoCount 必须与 ExternalSdpBuilder 的 m-line 数一致
-		// （固定 1 音频 + 1 视频），设为 0 会让 pjsua 以 488 拒绝建立媒体通道。
+		// 线上 SDP 由应用侧构造，仍是 sendrecv（应用要收发）。
+		// audioCount/videoCount 必须与 SDP 的 m-line 数一致（固定 1 音频 +
+		// 1 视频），设为 0 会让 pjsua 以 488 拒绝建立媒体通道。
 		param.opt.flag = PJSUA_CALL_SET_MEDIA_DIR;
 		param.opt.audioCount = 1;
 		param.opt.videoCount = 1;
@@ -121,8 +117,53 @@ bool SipCall::MakeCall(const std::string& target, int audioCount, int videoCount
 		std::string targetUri = target;
 		if (targetUri.find("sip:") == std::string::npos) targetUri = "sip:" + targetUri;
 
-		VCS_GATEWAY_LOG_INFO("Making call to: %s (pjsua media dir=NONE, SDP in onCallSdpCreated)",
-		                     targetUri.c_str());
+		// ============================================================
+		// mediaAppManaged：pjsua 不再生成 offer。makeCall 时没有 SDP 会直接
+		// 返回 PJ_EINVALIDOP，所以出呼前必须先由应用侧构造并校验 offer。
+		// ============================================================
+		std::string offerSdp;
+		if (sdpNegotiator_) {
+			vcs::media_config::MediaSdpRequest request;
+			request.callId = targetUri;
+			request.localIp = localIpAddress_;
+			request.audioPort = localAudioPort_;
+			request.videoPort = localVideoPort_;
+			request.enableAudio = (audioCount > 0);
+			request.enableVideo = (videoCount > 0);
+
+			const vcs::media_config::MediaSdpResult offer = sdpNegotiator_->CreateOffer(request);
+			if (!offer.ok) {
+				VCS_GATEWAY_LOG_ERROR("MakeCall: CreateOffer failed: %s", offer.error.c_str());
+				return false;
+			}
+
+			const vcs::media_config::MediaSdpValidationResult validation =
+				sdpNegotiator_->ValidateSdp(offer.sdp);
+			if (!validation.valid) {
+				std::string errors;
+				for (const std::string& error : validation.errors) {
+					errors += error + "; ";
+				}
+				VCS_GATEWAY_LOG_ERROR("MakeCall: generated offer is invalid: %s", errors.c_str());
+				return false;
+			}
+			offerSdp = offer.sdp;
+		} else {
+			// 未注入 negotiator 时保持原有行为：用 ExternalSdpBuilder 生成文本 SDP。
+			pj::SdpSession offer = ExternalSdpBuilder::buildOfferSdp(
+				localIpAddress_, localAudioPort_, localVideoPort_);
+			offerSdp = offer.wholeSdp;
+		}
+
+		if (offerSdp.empty()) {
+			VCS_GATEWAY_LOG_ERROR("MakeCall: no SDP offer available (app-managed media "
+			                      "requires one)");
+			return false;
+		}
+		param.sdp.wholeSdp = offerSdp;
+
+		VCS_GATEWAY_LOG_INFO("Making call to: %s (app-managed media, offer %zu bytes)",
+		                     targetUri.c_str(), offerSdp.size());
 		makeCall(targetUri, param);
 
 		callInfo_.callId = getId();
@@ -139,184 +180,103 @@ bool SipCall::MakeCall(const std::string& target, int audioCount, int videoCount
 bool SipCall::Answer(int code) {
     try {
         // ============================================================
-        // [Ultimate Solution] Completely bypass PJSUA/PJSIP media subsystem
+        // 走 pjsua 的 call 模型应答（不再自己拼 200 OK）。
         //
-        // Goal: Directly send raw SIP response containing external SDP
-        // - Do not use pjsip_inv_answer (it triggers media negotiation crash)
-        // - Use pjsip_endpt_create_response directly to create response
-        // - Set SDP body directly into message
-        //
-        // Steps:
-        // 1. Get call and invite session
-        // 2. Generate external SDP
-        // 3. Use pjsip_endpt_create_response to create 200 OK
-        // 4. Set external SDP directly as message body
-        // 5. Use pjsip_inv_send_msg to send
+        // mediaAppManaged 下 pjsua 既不生成也不校验 SDP：
+        //   * answer 必须由应用提供（CallOpParam::sdp.wholeSdp），否则 2xx 被拒；
+        //   * pjsua 仍然负责 INVITE 事务、对话状态、ACK/BYE 与后续 re-INVITE。
+        // RTP 由应用侧传输承担，端口用 OnIncomingCall 分配的每呼叫端口。
         // ============================================================
-
         pjsua_call_id callId = getId();
         if (callId < 0 || callId >= (int)pjsua_var.ua_cfg.max_calls) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] Answer: Invalid callId: %d", callId);
+            VCS_GATEWAY_LOG_ERROR("Answer: invalid callId=%d", callId);
+            return false;
+        }
+        if (localIpAddress_.empty()) {
+            VCS_GATEWAY_LOG_ERROR("Answer: localIp is not configured");
             return false;
         }
 
-        // Use configured local IP and port
-        std::string localIp = localIpAddress_;
-        if (localIp.empty()) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] localIp is NOT configured!");
-            return false;
+        // 对端 offer：pjsua2 在 onIncomingCall 之前清空 incoming_data，
+        // 所以优先用 SipAccount 传来、SipSignalingHandler 存下的 SDP 文本。
+        std::string remoteOffer = incomingOfferSdp_;
+        pjsip_rx_data* rdata = incomingRdata_;
+        if (remoteOffer.empty() && !rdata) {
+            rdata = pjsua_var.calls[callId].incoming_data;
         }
-
-        // 通告端口取实际绑定值，配置端口只在查询失败时兜底。
-        int boundAudioPort = 0;
-        int boundVideoPort = 0;
-        if (!GetLocalMediaPorts(boundAudioPort, boundVideoPort)) {
-            boundAudioPort = static_cast<int>(localAudioPort_);
-            boundVideoPort = static_cast<int>(localVideoPort_);
-            VCS_GATEWAY_LOG_WARNING("[ExternalSdp] Call %d: media transports not bound yet, "
-                                    "falling back to configured ports", callId);
-        }
-
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] ========== RAW SIP RESPONSE ==========");
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Call %d: Bypassing PJSUA media subsystem", callId);
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Local IP: %s, Audio: %d, Video: %d",
-                            localIp.c_str(), boundAudioPort, boundVideoPort);
-
-        // Get underlying pjsua_call and invite session
-        pjsua_call* call = &pjsua_var.calls[callId];
-        pjsip_inv_session* inv = call->inv;
-        if (!inv) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] pjsip_inv_session is NULL!");
-            return false;
-        }
-
-        // Original INVITE rx_data. Our own clone survives past the
-        // on_incoming_call callback; pjsua's incoming_data only lives
-        // during that callback and is a last-resort fallback (prompt answer).
-        pjsip_rx_data* rdata = incomingRdata_ ? incomingRdata_ : call->incoming_data;
-        if (!rdata) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] rdata is NULL (no cloned INVITE; "
-                                  "answered outside the incoming-call callback?)");
-            return false;
-        }
-
-        // Generate external SDP (use pjsua_var.pool to ensure memory is valid)
-        pj::SdpSession answerSdp = ExternalSdpBuilder::buildOfferSdp(
-            localIp, static_cast<uint16_t>(boundAudioPort),
-            static_cast<uint16_t>(boundVideoPort));
-        pjmedia_sdp_session* sdp = static_cast<pjmedia_sdp_session*>(answerSdp.pjSdpSession);
-
-        if (!sdp) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] External SDP is NULL!");
-            return false;
-        }
-
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] External SDP prepared: media_count=%u", sdp->media_count);
-        for (unsigned i = 0; i < sdp->media_count; i++) {
-            pjmedia_sdp_media* m = sdp->media[i];
-            if (m) {
-                char media_name[32];
-                pj_str_t media_str = m->desc.media;
-                snprintf(media_name, sizeof(media_name), "%.*s", (int)media_str.slen, media_str.ptr);
-                VCS_GATEWAY_LOG_DEBUG("[ExternalSdp]   Media[%u]: %s, port=%u",
-                                    i, media_name, m->desc.port);
+        if (rdata && rdata->msg_info.msg && rdata->msg_info.msg->body) {
+            pjsip_msg_body* body = rdata->msg_info.msg->body;
+            if (body->data && body->len > 0) {
+                remoteOffer.assign(static_cast<const char*>(body->data),
+                                   static_cast<size_t>(body->len));
             }
         }
 
-        pj_status_t status;
-        pjsip_tx_data* tdata = nullptr;
+        // INVITE 带了 offer 但拿不到它的文本时不能退化成"发 offer"：
+        // 200 OK 里只能是 answer。宁可失败也不要发一份语义错误的 SDP。
+        if (remoteOffer.empty()) {
+            pjsip_inv_session* inv = pjsua_var.calls[callId].inv;
+            if (inv && inv->neg &&
+                pjmedia_sdp_neg_get_state(inv->neg) == PJMEDIA_SDP_NEG_STATE_REMOTE_OFFER) {
+                VCS_GATEWAY_LOG_ERROR("Answer: remote offer text is missing "
+                                      "although the INVITE carried one");
+                return false;
+            }
+        }
 
-        // ============================================================
-        // [Key] Create raw SIP response directly, skip INVITE session
-        // Use pjsip_endpt_create_response instead of pjsip_inv_answer
-        // ============================================================
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Creating raw 200 OK response...");
+        std::string answerSdp;
+        if (sdpNegotiator_) {
+            if (!remoteOffer.empty()) {
+                const vcs::media_config::MediaSdpValidationResult validation =
+                    sdpNegotiator_->ValidateSdp(remoteOffer);
+                if (!validation.valid) {
+                    std::string errors;
+                    for (const std::string& error : validation.errors) {
+                        errors += error + "; ";
+                    }
+                    VCS_GATEWAY_LOG_ERROR("Answer: remote offer is invalid: %s", errors.c_str());
+                    return false;
+                }
+            }
 
-        // Get endpoint
-        pjsip_endpoint* endpt = pjsua_var.endpt;
-        if (!endpt) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] pjsip_endpoint is NULL!");
+            vcs::media_config::MediaSdpRequest request;
+            request.callId = std::to_string(callId);
+            request.localIp = localIpAddress_;
+            request.audioPort = localAudioPort_;
+            request.videoPort = localVideoPort_;
+            request.audioRtcpMux = remoteOffer.find("a=rtcp-mux") != std::string::npos;
+            request.videoRtcpMux = request.audioRtcpMux;
+
+            // offerless INVITE：answer() 里带的 SDP 充当本地 offer。
+            const vcs::media_config::MediaSdpResult answer = remoteOffer.empty()
+                ? sdpNegotiator_->CreateOffer(request)
+                : sdpNegotiator_->CreateAnswer(request, remoteOffer);
+            if (!answer.ok) {
+                VCS_GATEWAY_LOG_ERROR("Answer: failed to build SDP: %s", answer.error.c_str());
+                return false;
+            }
+            answerSdp = answer.sdp;
+        } else {
+            // 未注入 negotiator 时沿用外部 SDP 文本。
+            answerSdp = ExternalSdpBuilder::buildOfferSdp(
+                localIpAddress_, localAudioPort_, localVideoPort_).wholeSdp;
+        }
+
+        if (answerSdp.empty()) {
+            VCS_GATEWAY_LOG_ERROR("Answer: empty SDP (app-managed media requires one)");
             return false;
         }
 
-        // Create 200 OK response (using original rdata, not through inv)
-        status = pjsip_endpt_create_response(endpt, rdata, 200, nullptr, &tdata);
-        if (status != PJ_SUCCESS) {
-            char errbuf[256];
-            pj_strerror(status, errbuf, sizeof(errbuf));
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] pjsip_endpt_create_response failed: %s", errbuf);
-            return false;
-        }
+        pj::CallOpParam param;
+        param.statusCode = static_cast<pjsip_status_code>(code);
+        param.sdp.wholeSdp = answerSdp;
+        answer(param);
 
-        // ============================================================
-        // [Core] Set SDP body directly into message
-        // Use pjsip_create_sdp_body API to set SDP
-        // ============================================================
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Setting external SDP body...");
-
-        // Use pjsip_create_sdp_body to create message body from SDP structure
-        status = pjsip_create_sdp_body(tdata->pool, sdp, &tdata->msg->body);
-        if (status != PJ_SUCCESS || !tdata->msg->body) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] pjsip_create_sdp_body failed!");
-            pjsip_tx_data_dec_ref(tdata);
-            return false;
-        }
-
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] SDP body created successfully");
-
-        // Contact must point at the socket this endpoint actually listens on.
-        // Prefer the configured signaling port; fall back to the port of the
-        // transport that received the INVITE (handles port=0 / auto-bind).
-        uint16_t contactPort = localSignalingPort_;
-        if (contactPort == 0 && rdata->tp_info.transport) {
-            contactPort = static_cast<uint16_t>(rdata->tp_info.transport->local_name.port);
-        }
-        if (contactPort == 0) {
-            contactPort = 5060;
-        }
-
-        char contact_uri[256];
-        snprintf(contact_uri, sizeof(contact_uri), "<sip:%s:%u>", localIp.c_str(),
-                 static_cast<unsigned>(contactPort));
-
-        // pjsip_parse_uri() parses in place and keeps pointers into the
-        // buffer, so the text must live in the tx-data pool, not on stack.
-        const size_t contactLen = strlen(contact_uri);
-        char* uriBuf = static_cast<char*>(pj_pool_alloc(tdata->pool, contactLen + 1));
-        memcpy(uriBuf, contact_uri, contactLen + 1);
-
-        pjsip_contact_hdr* contact = pjsip_contact_hdr_create(tdata->pool);
-        contact->uri = pjsip_parse_uri(tdata->pool, uriBuf, contactLen, 0);
-        if (!contact->uri) {
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] Failed to parse Contact URI '%s'", contact_uri);
-            pjsip_tx_data_dec_ref(tdata);
-            return false;
-        }
-        pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr*)contact);
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Contact: %s", contact_uri);
-
-        // Content-Length is automatically calculated by PJSIP, no manual setting needed
-
-        // ============================================================
-        // Use inv->dlg to send response
-        // This sends through dialog layer, maintaining dialog state
-        // ============================================================
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] Sending 200 OK via dialog...");
-
-        status = pjsip_dlg_send_response(inv->dlg, inv->invite_tsx, tdata);
-        if (status != PJ_SUCCESS) {
-            char errbuf[256];
-            pj_strerror(status, errbuf, sizeof(errbuf));
-            VCS_GATEWAY_LOG_ERROR("[ExternalSdp] pjsip_dlg_send_response failed: %s", errbuf);
-            return false;
-        }
-
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] ========== RAW SIP SUCCESS ==========");
-        VCS_GATEWAY_LOG_DEBUG("[ExternalSdp] 200 OK sent with external SDP (bypassed all PJSUA media)");
+        VCS_GATEWAY_LOG_INFO("Answered call %d with %d (app-managed SDP, %zu bytes)",
+                             callId, code, answerSdp.size());
         return true;
-
     } catch (const pj::Error& err) {
-        VCS_GATEWAY_LOG_ERROR("[ExternalSdp] Failed to answer call: %s", err.info().c_str());
+        VCS_GATEWAY_LOG_ERROR("Failed to answer call: %s", err.info().c_str());
         return false;
     }
 }
@@ -698,8 +658,44 @@ void SipCall::onCallMediaTransportState(pj::OnCallMediaTransportStateParam& prm)
 }
 
 void SipCall::onCallRxOffer(pj::OnCallRxOfferParam& prm) {
-	VCS_GATEWAY_LOG_INFO("onCallRxOffer: callId=%d, manually crafting answer SDP to prevent crash", callInfo_.callId);
-	
+	VCS_GATEWAY_LOG_INFO("onCallRxOffer: callId=%d, building answer with app negotiator",
+	                     callInfo_.callId);
+
+	if (!sdpNegotiator_) {
+		// 非 app-managed 时保持旧行为（pjsua 自己生成 answer）。
+		return;
+	}
+
+	const vcs::media_config::MediaSdpValidationResult validation =
+		sdpNegotiator_->ValidateSdp(prm.offer.wholeSdp);
+	if (!validation.valid) {
+		std::string errors;
+		for (const std::string& error : validation.errors) {
+			errors += error + "; ";
+		}
+		VCS_GATEWAY_LOG_ERROR("onCallRxOffer: remote offer is invalid: %s", errors.c_str());
+		prm.statusCode = PJSIP_SC_NOT_ACCEPTABLE_HERE;
+		return;
+	}
+
+	vcs::media_config::MediaSdpRequest request;
+	request.callId = std::to_string(callInfo_.callId);
+	request.localIp = localIpAddress_;
+	request.audioPort = localAudioPort_;
+	request.videoPort = localVideoPort_;
+	request.audioRtcpMux = prm.offer.wholeSdp.find("a=rtcp-mux") != std::string::npos;
+	request.videoRtcpMux = request.audioRtcpMux;
+
+	const vcs::media_config::MediaSdpResult answer =
+		sdpNegotiator_->CreateAnswer(request, prm.offer.wholeSdp);
+	if (!answer.ok) {
+		VCS_GATEWAY_LOG_ERROR("onCallRxOffer: CreateAnswer failed: %s", answer.error.c_str());
+		prm.statusCode = PJSIP_SC_NOT_ACCEPTABLE_HERE;
+		return;
+	}
+
+	prm.answer.wholeSdp = answer.sdp;
+	VCS_GATEWAY_LOG_INFO("onCallRxOffer: answer SDP prepared (%zu bytes)", answer.sdp.size());
 }
 
 void SipCall::UpdateCallInfo() {

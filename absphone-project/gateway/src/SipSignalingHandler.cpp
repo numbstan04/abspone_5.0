@@ -424,12 +424,29 @@ int SipSignalingHandler::DoInitiateCall(const std::string& callee, const Params&
         // Create outbound call
         auto call = std::make_unique<SipCall>(*sipAccount_, this);
 
+        // mediaAppManaged 下 pjsua 不创建媒体通道，出呼的 RTP 由应用侧
+        // SimpleRtpTransport 承担（SipAdapter::OnCallConnected）。因此这里
+        // 按呼叫分配一对端口，既写进 offer，也用于后续绑定。
+        uint16_t audioPort = localAudioPort_;
+        uint16_t videoPort = localVideoPort_;
+        uint16_t allocatedAudioPort = 0;
+        uint16_t allocatedVideoPort = 0;
+        const bool portsFromPool = portAllocator_.Allocate(allocatedAudioPort, allocatedVideoPort);
+        if (portsFromPool) {
+            audioPort = allocatedAudioPort;
+            videoPort = allocatedVideoPort;
+        }
+
         // Set local media configuration (read from config file, set via SetLocalMediaAddress/SetLocalMediaPorts)
         call->SetLocalIpAddress(localMediaAddress_);
-        call->SetLocalMediaPorts(localAudioPort_, localVideoPort_);
+        call->SetLocalMediaPorts(audioPort, videoPort);
         call->SetLocalSignalingPort(localPort_);
         // 应用侧自持 RTP：pjsua 只保留信令，pjmedia 不得再发一路媒体。
         call->SetExternalMediaPlane(!UsesStackMediaEngine());
+        // 应用侧 SDP：出呼 offer / 收到 re-offer 的 answer 都由它生成。
+        if (sdpNegotiator_) {
+            call->SetMediaSdpNegotiator(sdpNegotiator_);
+        }
 
         std::string target = callee;
         if (target.find("sip:") == std::string::npos) {
@@ -448,9 +465,15 @@ int SipSignalingHandler::DoInitiateCall(const std::string& callee, const Params&
 			int callId = call->getId();
             std::lock_guard<std::mutex> lock(callsMutex_);
             activeCalls_[callId] = std::move(call);
+            callPorts_[callId] = std::make_pair(
+                portsFromPool ? allocatedAudioPort : 0,
+                portsFromPool ? allocatedVideoPort : 0);
             return callId;
         }
 
+        if (portsFromPool) {
+            portAllocator_.Release(allocatedAudioPort, allocatedVideoPort);
+        }
         VCS_GATEWAY_LOG_ERROR("[SIP] DoInitiateCall: MakeCall('%s') returned false", target.c_str());
         return -1;
     } catch (const pj::Error& err) {
@@ -526,7 +549,8 @@ void SipSignalingHandler::OnRegistrationFailure(int accountId, uint32_t code, co
 
 void SipSignalingHandler::OnIncomingCall(int accountId, int callId,
                                          const std::string& callerUri,
-                                         const std::string& callerDisplayName) {
+                                         const std::string& callerDisplayName,
+                                         const std::string& sdpBody) {
     (void)accountId;
 
     VCS_GATEWAY_LOG_INFO("Incoming call: callId=%d, caller=%s, display=%s",
@@ -535,31 +559,39 @@ void SipSignalingHandler::OnIncomingCall(int accountId, int callId,
     // Create SipCall object for inbound call and add to activeCalls_
     std::unique_ptr<SipCall> incomingCall(new SipCall(*sipAccount_, callId, this));
 
+    // mediaAppManaged 下 pjsua 不创建媒体通道，入呼的 RTP 由应用侧传输承担，
+    // 因此每通呼叫从端口池分配一对端口：既写进 200 OK 的 SDP，也用于绑定。
+    uint16_t audioPort = localAudioPort_;
+    uint16_t videoPort = localVideoPort_;
+    uint16_t allocatedAudioPort = 0;
+    uint16_t allocatedVideoPort = 0;
+    const bool portsFromPool = portAllocator_.Allocate(allocatedAudioPort, allocatedVideoPort);
+    if (portsFromPool) {
+        audioPort = allocatedAudioPort;
+        videoPort = allocatedVideoPort;
+    }
+
     // Set local media configuration (read from config file, set via SetLocalMediaAddress/SetLocalMediaPorts)
     incomingCall->SetLocalIpAddress(localMediaAddress_);
-    incomingCall->SetLocalMediaPorts(localAudioPort_, localVideoPort_);
+    incomingCall->SetLocalMediaPorts(audioPort, videoPort);
     incomingCall->SetLocalSignalingPort(localPort_);
     // 应用侧自持 RTP：pjsua 只保留信令，pjmedia 不得再发一路媒体。
     incomingCall->SetExternalMediaPlane(!UsesStackMediaEngine());
-
-    // The external-SDP answer builds a raw 200 OK from the INVITE request.
-    // pjsua frees pjsua_call::incoming_data as soon as this callback returns,
-    // so clone the request now; a delayed Answer() would otherwise see NULL.
-    if (callId >= 0 && callId < static_cast<int>(pjsua_var.ua_cfg.max_calls)) {
-        pjsip_rx_data* inviteRdata = pjsua_var.calls[callId].incoming_data;
-        if (!incomingCall->CloneIncomingRequest(inviteRdata)) {
-            VCS_GATEWAY_LOG_WARNING("[SipSignalingHandler] No INVITE clone for call %d; "
-                                    "Answer() must be called before this callback returns",
-                                    callId);
-        }
-    } else {
-        VCS_GATEWAY_LOG_ERROR("[SipSignalingHandler] Invalid callId %d for INVITE clone", callId);
+    if (sdpNegotiator_) {
+        incomingCall->SetMediaSdpNegotiator(sdpNegotiator_);
     }
+
+    // 对端 offer 由 SipAccount 从 INVITE 里取出（pjsua2 已清空
+    // incoming_data）；后续 SipCall::Answer 用它生成 answer。
+    incomingCall->SetIncomingOfferSdp(sdpBody);
 
     // Add to activeCalls_
     {
         std::lock_guard<std::mutex> lock(callsMutex_);
         activeCalls_[callId] = std::move(incomingCall);
+        if (portsFromPool) {
+            callPorts_[callId] = std::make_pair(allocatedAudioPort, allocatedVideoPort);
+        }
     }
 
     // [V7.0 Phase-2 A] Extract the conference id BEFORE creating the session.
@@ -596,6 +628,11 @@ void SipSignalingHandler::OnIncomingCall(int accountId, int callId,
     if (!session) {
         VCS_GATEWAY_LOG_ERROR("Failed to create session for call %d", callId);
         std::lock_guard<std::mutex> lock(callsMutex_);
+        auto it = callPorts_.find(callId);
+        if (it != callPorts_.end()) {
+            portAllocator_.Release(it->second.first, it->second.second);
+            callPorts_.erase(it);
+        }
         activeCalls_.erase(callId);
         return;
     }
@@ -1233,6 +1270,11 @@ bool SipSignalingHandler::initPjsip() {
         sipAccount_->create(accountConfig);
         VCS_GATEWAY_LOG_DEBUG("[Signaling] sipAccount_->create() done");
 
+        // 确认应用自管理媒体真的下发到了协议栈（否则 pjsua 仍会建媒体通道）。
+        const int accId = sipAccount_->getId();
+        VCS_GATEWAY_LOG_INFO("[Signaling] account %d mediaAppManaged=%d",
+                             accId, pjsua_var.acc[accId].cfg.media_app_managed ? 1 : 0);
+
         pjsipInitialized_ = true;
         VCS_GATEWAY_LOG_INFO("[SIP] SipSignalingHandler initialized");
         return true;
@@ -1270,8 +1312,44 @@ SipCall* SipSignalingHandler::GetActiveCall(int callId) {
 }
 
 void SipSignalingHandler::RemoveActiveCall(int callId) {
+    // Destroy calls retired by a previous hangup first: their callback stacks
+    // have already unwound. Must run before taking callsMutex_ (see
+    // DrainRetiredCalls) and must never run on the retiring call's own stack.
+    DrainRetiredCalls();
+
     std::lock_guard<std::mutex> lock(callsMutex_);
-    activeCalls_.erase(callId);
+
+    // 从端口池分配的每呼叫端口随呼叫结束归还，避免下一通呼叫无端口可用。
+    auto it = callPorts_.find(callId);
+    if (it != callPorts_.end()) {
+        if (it->second.first != 0 && it->second.second != 0) {
+            portAllocator_.Release(it->second.first, it->second.second);
+            VCS_GATEWAY_LOG_INFO("[SIP] Released per-call ports for callId=%d: audio=%u, video=%u",
+                                 callId, it->second.first, it->second.second);
+        }
+        callPorts_.erase(it);
+    }
+
+    // Park instead of destroying: this runs on the retiring SipCall's own
+    // callback stack (SipCall::onCallState -> callback_->OnCallState ->
+    // TerminateSession -> RemoveActiveCall). Erasing here destroys the object
+    // whose method is still executing, so the remaining statements of
+    // onCallState (logging callInfo_) read freed memory.
+    auto callIt = activeCalls_.find(callId);
+    if (callIt != activeCalls_.end()) {
+        retiredCalls_.push_back(std::move(callIt->second));
+        activeCalls_.erase(callIt);
+    }
+}
+
+void SipSignalingHandler::DrainRetiredCalls() {
+    std::vector<std::unique_ptr<SipCall>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(callsMutex_);
+        doomed.swap(retiredCalls_);
+    }
+    // 锁外析构：SipCall 的析构会回调 handler（释放端口/注销传输）。
+    doomed.clear();
 }
 
 /**
@@ -1829,6 +1907,8 @@ pj_status_t SipSignalingHandler::handleInvite(pjsip_rx_data* rdata) {
         getMediaInfo(localIp, audioPort, videoPort);
     }
 
+    // SDP 协商/校验已移到 pjsua 的呼叫模型（SipCall::Answer / onCallRxOffer）。
+    // 本函数只在 INVITE 拦截模块启用时作为旁路路径存在，保持原有构造。
     pjmedia_sdp_session* localSdp = buildExternalSdp(pool, localIp, audioPort, videoPort, &remoteInfo);
     if (!localSdp) {
         VCS_GATEWAY_LOG_ERROR("[Signaling] Failed to build external SDP");

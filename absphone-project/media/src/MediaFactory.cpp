@@ -1,5 +1,6 @@
 ﻿#include "MediaFactory.h"
 #include "MediaControl.h"
+#include "MediaSdpNegotiator.h"
 #include "IPlatformMediaFactory.h"
 #include "ILogger.h"
 
@@ -49,6 +50,12 @@ namespace vcs {
 				impl_->initialized = true;
 			}
 			return control;
+		}
+
+		std::shared_ptr<vcs::media_config::IMediaSdpNegotiator>
+		MediaFactory::CreateSdpNegotiator() {
+			// 无状态：offer/answer 全部由入参决定，多个消费者可共用一个实例。
+			return std::make_shared<MediaSdpNegotiator>();
 		}
 
 	} // namespace media

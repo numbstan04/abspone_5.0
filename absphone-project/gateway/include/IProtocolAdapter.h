@@ -7,6 +7,7 @@
 #include "EventBus.h"
 #include "CallSession.h"
 #include "MediaConfig.h"
+#include "IMediaSdpNegotiator.h"
 #include <string>
 #include <memory>
 #include <vector>
@@ -269,6 +270,43 @@ public:
      * @param videoPort Local video RTP port
      */
     virtual void SetLocalMediaPorts(uint16_t audioPort, uint16_t videoPort) = 0;
+
+    // ============================================================
+    // Application-managed media SDP (pjsua mediaAppManaged)
+    // ============================================================
+
+    /**
+     * @brief Inject the application-side SDP negotiator
+     *
+     * Required when the account runs with callConfig.mediaAppManaged: the
+     * stack neither generates nor validates SDP, so offers/answers must come
+     * from this negotiator. Adapters that cannot manage media keep the
+     * default no-op.
+     */
+    virtual void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) {
+        (void)negotiator;
+    }
+
+    /// Get the injected SDP negotiator (nullptr when app-managed media is off)
+    virtual std::shared_ptr<vcs::media_config::IMediaSdpNegotiator>
+        GetMediaSdpNegotiator() const {
+        return nullptr;
+    }
+
+    // ============================================================
+    // Protocol stack logging (pjsip/pjmedia)
+    // ============================================================
+
+    /**
+     * @brief Set the protocol stack log level at runtime
+     *
+     * @param level pj_log level: 0=off, 1=fatal, 2=error, 3=warning,
+     *              4=info, 5=debug, 6=trace
+     *
+     * Adapters without their own stack logger keep the default no-op.
+     */
+    virtual void SetStackLogLevel(int level) { (void)level; }
 };
 
 } // namespace gateway

@@ -532,6 +532,14 @@ private:
     void RemoveFromCallIdIndex(const std::vector<int>& callIds);
 
     /**
+     * @brief 从全局 callId 索引移除单个条目
+     *
+     * 只做两次 map erase，不构造临时 std::vector：调用方（挂断路径，
+     * 运行在 pjsip 回调线程）不再为 4 字节的 callId 做一次堆分配。
+     */
+    void RemoveFromCallIdIndex(int callId);
+
+    /**
      * @brief sessionId 生成：{sip|h323|webrtc|sess}_{自增序号}
      */
     std::string GenerateSessionId(ProtocolType protocol);

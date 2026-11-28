@@ -6,6 +6,7 @@
 #include "IModuleFactory.h"
 #include "IGatewayManager.h"
 #include "IProtocolAdapter.h"
+#include "StackLogConfig.h"
 #include <memory>
 #include <string>
 
@@ -39,11 +40,13 @@ public:
      * @brief Create a SIP protocol adapter
      * @param listenAddress Listen address
      * @param port Listen port
+     * @param logSettings Protocol stack log settings from the upper layer
      * @return Pointer to the SIP adapter interface
      */
     virtual std::unique_ptr<IProtocolAdapter> CreateSipAdapter(
         const std::string& listenAddress,
-        uint16_t port) = 0;
+        uint16_t port,
+        const PjsipLogSettings& logSettings = PjsipLogSettings()) = 0;
 
     /**
      * @brief Create an H.323 protocol adapter
@@ -73,7 +76,8 @@ public:
     std::unique_ptr<IGatewayManager> CreateGatewayManager(vcs::base::IConfig* config) override;
     std::unique_ptr<IProtocolAdapter> CreateSipAdapter(
         const std::string& listenAddress,
-        uint16_t port) override;
+        uint16_t port,
+        const PjsipLogSettings& logSettings = PjsipLogSettings()) override;
     std::unique_ptr<IProtocolAdapter> CreateH323Adapter(
         const std::string& listenAddress,
         uint16_t port) override;

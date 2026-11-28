@@ -138,7 +138,40 @@ void GatewayManager::RegisterAdapter(std::shared_ptr<IProtocolAdapter> adapter) 
         VCS_GATEWAY_LOG_ERROR("[GatewayManager] RegisterAdapter: SM is null!");
     }
 
+    // Adapters registered after the negotiator was injected must still see it.
+    if (sdpNegotiator_) {
+        adapter->SetMediaSdpNegotiator(sdpNegotiator_);
+        VCS_GATEWAY_LOG_INFO(
+            "[GatewayManager] RegisterAdapter: injected SDP negotiator into %s adapter",
+            adapter->GetType().c_str());
+    }
+
     adapters_[adapter->GetType()] = adapter;
+}
+
+void GatewayManager::SetMediaSdpNegotiator(
+    std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sdpNegotiator_ = std::move(negotiator);
+    for (auto& pair : adapters_) {
+        if (pair.second) {
+            pair.second->SetMediaSdpNegotiator(sdpNegotiator_);
+        }
+    }
+    VCS_GATEWAY_LOG_INFO("[GatewayManager] SDP negotiator %s",
+                         sdpNegotiator_ ? "injected into all adapters" : "cleared");
+}
+
+void GatewayManager::SetStackLogLevel(int level) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    for (auto& pair : adapters_) {
+        if (pair.second) {
+            pair.second->SetStackLogLevel(level);
+        }
+    }
+    VCS_GATEWAY_LOG_INFO("[GatewayManager] Stack log level set to %d", level);
 }
 
 void GatewayManager::UnregisterAdapter(const std::string& type) {

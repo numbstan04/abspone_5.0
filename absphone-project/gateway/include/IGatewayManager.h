@@ -6,6 +6,7 @@
 #include "IProtocolAdapter.h"
 #include "IRtpTransport.h"
 #include "EventBus.h"
+#include "IMediaSdpNegotiator.h"
 #include <string>
 #include <memory>
 #include <vector>
@@ -129,6 +130,23 @@ public:
     // Set the platform event bus (passed to all adapters). Gateway publishes
     // signaling facts on it and never calls into upper layers.
     virtual void SetEventBus(std::shared_ptr<vcs::IEventBus> bus) = 0;
+
+    // ============================================================
+    // Application-managed media SDP (pjsua mediaAppManaged)
+    //
+    // Injected by the composition root before Start(). Gateway forwards it to
+    // every registered adapter (and to adapters registered later), so the SIP
+    // adapter can create offers/answers and validate SDP itself.
+    // ============================================================
+    virtual void SetMediaSdpNegotiator(
+        std::shared_ptr<vcs::media_config::IMediaSdpNegotiator> negotiator) = 0;
+
+    // ============================================================
+    // Protocol stack logging
+    // Forwarded to every adapter so pjsip/pjmedia logs follow the
+    // application's log level without restarting the process.
+    // ============================================================
+    virtual void SetStackLogLevel(int level) = 0;
 
     // ============================================================
     // 收包门（docs/09 §2.2）
